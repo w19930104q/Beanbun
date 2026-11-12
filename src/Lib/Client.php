@@ -400,6 +400,123 @@ class Client
     }
 
     /**
+     * commit. Atomic batch commit for transactional queues.
+     * @param string $key
+     * @param array $payload
+     * @throws \Exception
+     */
+    public function commit($key, array $payload)
+    {
+        $payload['cmd'] = 'commit';
+        $payload['key'] = $key;
+        $connection = $this->getConnection($key);
+        $this->writeToRemote($payload, $connection);
+        return $this->readFromRemote($connection);
+    }
+
+    /**
+     * setAdd. Add a value to an array-backed set (no duplicates).
+     * @param string $key
+     * @param mixed $value
+     * @throws \Exception
+     */
+    public function setAdd($key, $value)
+    {
+        $connection = $this->getConnection($key);
+        $this->writeToRemote(array(
+            'cmd' => 'setAdd',
+            'key' => $key,
+            'value' => $value,
+        ), $connection);
+        return $this->readFromRemote($connection);
+    }
+
+    /**
+     * setRemove.
+     * @param string $key
+     * @param mixed $value
+     * @throws \Exception
+     */
+    public function setRemove($key, $value)
+    {
+        $connection = $this->getConnection($key);
+        $this->writeToRemote(array(
+            'cmd' => 'setRemove',
+            'key' => $key,
+            'value' => $value,
+        ), $connection);
+        return $this->readFromRemote($connection);
+    }
+
+    /**
+     * setMembers.
+     * @param string $key
+     * @throws \Exception
+     */
+    public function setMembers($key)
+    {
+        $connection = $this->getConnection($key);
+        $this->writeToRemote(array(
+            'cmd' => 'setMembers',
+            'key' => $key,
+        ), $connection);
+        return $this->readFromRemote($connection);
+    }
+
+    /**
+     * hashIncr.
+     * @param string $key
+     * @param string $field
+     * @param int $step
+     * @throws \Exception
+     */
+    public function hashIncr($key, $field, $step = 1)
+    {
+        $connection = $this->getConnection($key);
+        $this->writeToRemote(array(
+            'cmd' => 'hashIncr',
+            'key' => $key,
+            'field' => $field,
+            'step' => $step,
+        ), $connection);
+        return $this->readFromRemote($connection);
+    }
+
+    /**
+     * hashGet.
+     * @param string $key
+     * @param string $field
+     * @throws \Exception
+     */
+    public function hashGet($key, $field)
+    {
+        $connection = $this->getConnection($key);
+        $this->writeToRemote(array(
+            'cmd' => 'hashGet',
+            'key' => $key,
+            'field' => $field,
+        ), $connection);
+        return $this->readFromRemote($connection);
+    }
+
+    /**
+     * hashDelete.
+     * @param string $key
+     * @param string $field
+     * @throws \Exception
+     */
+    public function hashDelete($key, $field)
+    {
+        $connection = $this->getConnection($key);
+        $this->writeToRemote(array(
+            'cmd' => 'hashDelete',
+            'key' => $key,
+            'field' => $field,
+        ), $connection);
+        return $this->readFromRemote($connection);
+    }
+
+    /**
      * Write data to global server.
      * @param string $buffer
      */

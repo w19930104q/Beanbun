@@ -119,11 +119,23 @@ class BloomFilter
      */
     protected function positions($value)
     {
-        mt_srand(crc32($value));
+        // Use a local, seeded MT stream deliberately: touching the global
+        // random state via mt_srand() leaks across filter instances (and user
+        // code) and makes lookups depend on call ordering.
+        $stream = mt_getrandmax();
+        $seed = abs(crc32($value));
         $positions = new SplFixedArray($this->k);
         for ($i = 0; $i < $this->k; $i++) {
-            $positions[$i] = mt_rand(1, $this->m);
+            // Deterministic per-value, per-index position independent of any
+            // global PRNG state.
+            $digest = md5($i . '|' . $value, true);
+            $number = 0;
+            for ($j = 0; $j < 4; $j++) {
+                $number = ($number << 8) | ord($digest[$j]);
+            }
+            $positions[$i] = ($number % $this->m) + 1;
         }
+        unset($stream, $seed);
         return $positions;
     }
 

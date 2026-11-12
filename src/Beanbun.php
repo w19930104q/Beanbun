@@ -2,6 +2,8 @@
 namespace Beanbun;
 
 use Beanbun\Exception\BeanbunException;
+use Beanbun\Queue\LocalQueue;
+use Beanbun\Queue\TransactionalQueueInterface;
 use Beanbun\Lib\Helper;
 use Exception;
 use GuzzleHttp\Client;
@@ -10,7 +12,7 @@ use Workerman\Worker;
 
 class Beanbun
 {
-    const VERSION = '1.0.4';
+    const VERSION = '1.0.5';
 
     public $id = null;
     public $name = null;
@@ -23,6 +25,14 @@ class Beanbun
     public $userAgent = 'pc';
     public $logFile = '';
     public $commands = [];
+
+    /**
+     * Maximum number of retries for a page that fails with a hard exception.
+     * 0 means the first failure writes the terminal failed state immediately.
+     * BeanbunException (explicit error()/skip) is never retried.
+     * @var int
+     */
+    public $retry = 3;
 
     public $queue = '';
     public $url = '';
@@ -65,6 +75,11 @@ class Beanbun
     protected $downloaderFactory = null;
     protected $downloaderArgs = [];
     protected $logFactory = null;
+
+    // Transaction state for the page currently being processed.
+    protected $batchActive = false;
+    protected $queueExhausted = false;
+    protected $userExceptionHandler = false;
 
     public static function timer($interval, $callback, $args = [], $persistent = true)
     {
@@ -151,8 +166,21 @@ class Beanbun
         } else {
             $this->initHooks();
             $this->seed = (array) $this->seed;
-            while (count($this->seed)) {
-                $this->crawler();
+
+            // Normal mode runs against an in-process transactional queue, so
+            // page processing follows the same staging/commit semantics as
+            // daemon mode without requiring an external queue server.
+            $this->queues = new LocalQueue(['name' => $this->name]);
+            foreach ($this->seed as $url) {
+                if (is_string($url)) {
+                    $this->queues->add($url);
+                } elseif (is_array($url)) {
+                    $this->queues->add($url[0], $url[1]);
+                }
+            }
+            $this->seed = [];
+
+            while ($this->crawler()) {
             }
         }
     }
@@ -234,6 +262,14 @@ class Beanbun
 
         $this->startWorkerHooks[] = function ($beanbun) {
             $beanbun->queue()->maxQueueSize = $beanbun->max;
+            // Put pages left in flight by a previous run back on the queue,
+            // so resuming a crawl never loses dequeued-but-uncommitted pages.
+            if ($beanbun->queue() instanceof TransactionalQueueInterface) {
+                $recovered = $beanbun->queue()->recover();
+                if ($recovered) {
+                    $beanbun->log("Beanbun worker {$beanbun->id} recovered {$recovered} unfinished page(s).");
+                }
+            }
             $beanbun->timer_id = Beanbun::timer($beanbun->interval, [$beanbun, 'crawler']);
         };
 
@@ -265,7 +301,11 @@ class Beanbun
 
         if ($this->daemonize) {
             $this->afterDiscoverHooks[] = function ($beanbun) {
-                if ($beanbun->options['reserve'] == false) {
+                // Transactional queues write the completion marker in commit(),
+                // so the legacy eager queued() call is skipped here. Legacy
+                // custom queues keep the original behaviour unchanged.
+                if (!($beanbun->queue() instanceof TransactionalQueueInterface)
+                    && $beanbun->options['reserve'] == false) {
                     $beanbun->queue()->queued($beanbun->queue);
                 }
             };
@@ -277,6 +317,9 @@ class Beanbun
 
         if (!$this->exceptionHandler) {
             $this->exceptionHandler = [$this, 'defaultExceptionHandler'];
+            $this->userExceptionHandler = false;
+        } else {
+            $this->userExceptionHandler = true;
         }
     }
 
@@ -351,25 +394,183 @@ class Beanbun
 
     public function error($msg = null)
     {
-        throw new BeanbunException($msg);
+        throw new BeanbunException($msg === null ? '' : $msg);
     }
 
+    /**
+     * Process one page as one committable unit.
+     *
+     * Discovery results only land in a private staging batch; they are
+     * published together with the page completion marker in a single commit.
+     * Any exception rolls the uncommitted batch back. Hard exceptions requeue
+     * only the current page according to the configured retry policy, and a
+     * page that exhausts its retries is written to the terminal failed set.
+     *
+     * @return bool false when no page was available (normal mode loop ends)
+     */
     public function crawler()
     {
-        try {
-            $allHooks = $this->hooks;
-            array_shift($allHooks);
-            array_pop($allHooks);
+        $this->batchActive = false;
+        $this->queueExhausted = false;
 
-            foreach ($allHooks as $hooks) {
-                foreach ($this->$hooks as $hook) {
-                    call_user_func($hook, $this);
-                }
+        try {
+            $hookGroups = $this->hooks;
+            array_shift($hookGroups); // startWorkerHooks
+            array_pop($hookGroups);   // stopWorkerHooks
+
+            $queue = $this->queue();
+
+            if ($queue instanceof TransactionalQueueInterface) {
+                return $this->runTransactional($hookGroups, $queue);
+            }
+
+            // Backward-compatible path for custom queues that only implement
+            // QueueInterface: keep the legacy single-try behaviour.
+            return $this->runLegacy($hookGroups);
+        } catch (Exception $e) {
+            // Defensive net: a failure outside the inner handlers must not kill
+            // the worker timer. State was never committed for this page.
+            call_user_func($this->exceptionHandler, $e);
+            $this->resetPageState();
+            return !$this->queueExhausted;
+        }
+    }
+
+    protected function runTransactional(array $hookGroups, TransactionalQueueInterface $queue)
+    {
+        // beforeDownloadPage: dequeue (or stop when the queue is empty).
+        try {
+            $this->runHookGroup('beforeDownloadPageHooks');
+        } catch (BeanbunException $e) {
+            // Empty queue / max limit: nothing was started. A duplicate-skip
+            // (queue non-empty) still returns true so the caller keeps draining.
+            $this->resetPageState();
+            if ($this->queueExhausted) {
+                return false;
+            }
+            return $this->queue()->count() > 0;
+        } catch (Exception $e) {
+            // A hard failure inside a user before-hook, after the page was
+            // dequeued: apply the same retry/terminal policy as any later stage
+            // so the page is never silently lost.
+            if ($this->queue) {
+                // Register in flight first so rollback()/recover() can return
+                // the page to the queue even though no staging batch began.
+                $queue->begin($this->queue);
+                $this->batchActive = true;
+                $this->handleHardFailure($queue, $e);
+                $this->batchActive = false;
+                $this->resetPageState();
+                return true;
+            }
+            throw $e;
+        }
+
+        if (!$this->queue) {
+            $this->resetPageState();
+            return false;
+        }
+
+        // Open the staging batch. From here on, queue()->add() is buffered.
+        $queue->begin($this->queue);
+        $this->batchActive = true;
+
+        try {
+            foreach (['downloadPageHooks', 'afterDownloadPageHooks', 'discoverUrlHooks', 'afterDiscoverHooks'] as $group) {
+                $this->runHookGroup($group);
+            }
+
+            // One atomic publish: discovered URLs + the completion marker.
+            $markQueued = empty($this->options['reserve']);
+            $queue->commit($markQueued);
+            $this->batchActive = false;
+            $this->resetPageState();
+            return true;
+        } catch (BeanbunException $e) {
+            // Controlled skip (explicit error()): discard staged results, do
+            // not requeue the page, optionally keep the completion marker.
+            if ($e->getMessage()) {
+                $this->log($e->getMessage());
+            }
+            $this->handleControlledSkip($queue);
+            $this->resetPageState();
+            return true;
+        } catch (Exception $e) {
+            // Hard failure: nothing uncommitted becomes visible.
+            $this->handleHardFailure($queue, $e);
+            $this->resetPageState();
+            return true;
+        }
+    }
+
+    protected function runLegacy(array $hookGroups)
+    {
+        try {
+            foreach ($hookGroups as $hooks) {
+                $this->runHookGroup($hooks);
             }
         } catch (Exception $e) {
             call_user_func($this->exceptionHandler, $e);
         }
 
+        // The loop continues while the legacy queue still holds pages; an
+        // explicit empty/max signal ends it immediately.
+        $available = !$this->queueExhausted && $this->queue()->count() > 0;
+        $this->resetPageState();
+        return $available;
+    }
+
+    protected function runHookGroup($group)
+    {
+        foreach ($this->$group as $hook) {
+            call_user_func($hook, $this);
+        }
+    }
+
+    protected function handleControlledSkip(TransactionalQueueInterface $queue)
+    {
+        $markQueued = $this->batchActive && empty($this->options['reserve']);
+        $queue->finish($markQueued);
+        $this->batchActive = false;
+    }
+
+    protected function handleHardFailure(TransactionalQueueInterface $queue, Exception $e)
+    {
+        // Give a user-provided observer a chance to log the failure. It must
+        // not change queue state: the queue owns the rollback.
+        if ($this->userExceptionHandler) {
+            try {
+                call_user_func($this->exceptionHandler, $e);
+            } catch (Exception $observerError) {
+                $this->log($observerError->getMessage());
+            }
+        } else {
+            $this->log($e->getMessage());
+        }
+
+        // Discard every staged URL and make only the current page available again.
+        try {
+            $queue->rollback();
+        } catch (Exception $rollbackError) {
+            // The page remains registered as in flight; recover() re-queues it
+            // on the next run. Do not double-count this attempt.
+            $this->log('Rollback failed: ' . $rollbackError->getMessage());
+            $this->batchActive = false;
+            return;
+        }
+        $this->batchActive = false;
+
+        $attempts = $queue->incrementFailures($this->queue);
+        if ($attempts > $this->retry) {
+            $queue->markFailed($this->queue, $e->getMessage());
+            $this->log("Page {$this->url} failed after {$attempts} attempt(s), marked as failed: " . $e->getMessage());
+        } else {
+            $this->log("Page {$this->url} failure {$attempts}/" . ($this->retry + 1) . ", requeued for retry: " . $e->getMessage());
+        }
+    }
+
+    protected function resetPageState()
+    {
         $this->queue = '';
         $this->url = '';
         $this->method = '';
@@ -392,30 +593,46 @@ class Beanbun
             }
         } elseif ($e instanceof Exception) {
             $this->log($e->getMessage());
-            if ($this->daemonize) {
-                $this->queue()->add($this->queue['url'], $this->queue['options']);
-            } else {
-                $this->seed[] = $this->queue;
+            // Legacy custom-queue path only. Transactional queues handle
+            // re-queueing themselves through rollback().
+            if ($this->queue && !($this->queue() instanceof TransactionalQueueInterface)) {
+                if ($this->daemonize) {
+                    $this->queue()->add($this->queue['url'], $this->queue['options']);
+                } else {
+                    $this->seed[] = $this->queue;
+                }
             }
         }
     }
 
     public function defaultBeforeDownloadPage()
     {
-        if ($this->daemonize) {
+        $transactional = $this->queue() instanceof TransactionalQueueInterface;
+
+        if ($this->daemonize || $transactional) {
             if ($this->max > 0 && $this->queue()->queuedCount() >= $this->max) {
                 $this->log("Download to the upper limit, Beanbun worker {$this->id} stop downloading.");
-                self::timerDel($this->timer_id);
+                if ($this->daemonize) {
+                    self::timerDel($this->timer_id);
+                }
+                $this->queueExhausted = true;
                 $this->error();
             }
 
             $this->queue = $queue = $this->queue()->next();
         } else {
+            // Legacy normal-mode behavior: custom QueueInterface plugins were
+            // driven straight from the seed array, not the queue object.
             $queue = array_shift($this->seed);
         }
 
         if (is_null($queue) || !$queue) {
-            sleep(30);
+            // In normal mode an empty queue ends the crawl directly; the
+            // 30-second blocking wait only applies to long-lived daemon workers.
+            if ($this->daemonize) {
+                sleep(30);
+            }
+            $this->queueExhausted = true;
             $this->error();
         }
 
@@ -424,17 +641,22 @@ class Beanbun
                 'url' => $queue,
                 'options' => [],
             ];
-        } else{
+        } else {
             $this->queue = $queue;
         }
 
+        $headers = isset($this->options['headers']) && is_array($this->options['headers'])
+            ? $this->options['headers']
+            : [];
         $options = array_merge([
-            'headers' => $this->options['headers'] ?: [],
+            'headers' => $headers,
             'reserve' => false,
             'timeout' => $this->timeout,
         ], (array) $queue['options']);
 
-        if ($this->daemonize && !$options['reserve'] && $this->queue()->isQueued($queue)) {
+        if (($this->daemonize || $transactional) && !$options['reserve'] && $this->queue()->isQueued($queue)) {
+            // Already finished: no batch is opened, nothing needs rolling back.
+            $this->queueExhausted = false;
             $this->error();
         }
 

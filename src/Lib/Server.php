@@ -181,6 +181,106 @@ class Server
                 }
                 return $connection->send(serialize($this->_dataArray[$key]->maybeInSet($data['value'])));
                 break;
+            case 'commit':
+                // Atomic batch commit: publish every staged URL and the page
+                // completion marker in a single server-side mutation.
+                // $data: key, queuedKey, bloom, markQueued, currentIdentity,
+                //        currentSerialized, items([[identity, serialized, reserve]])
+                if (!isset($this->_dataArray[$key]) || !is_array($this->_dataArray[$key])) {
+                    $this->_dataArray[$key] = array();
+                }
+                $bloomOn = !empty($data['bloom']);
+                $queuedBloom = $bloomOn && isset($this->_dataArray[$data['queuedKey']])
+                    && $this->_dataArray[$data['queuedKey']] instanceof BloomFilter
+                    ? $this->_dataArray[$data['queuedKey']]
+                    : null;
+                $queuedSet = !$bloomOn && isset($this->_dataArray[$data['queuedKey']])
+                    && is_array($this->_dataArray[$data['queuedKey']])
+                    ? $this->_dataArray[$data['queuedKey']]
+                    : array();
+
+                $added = 0;
+                $maxQueueSize = isset($data['maxQueueSize']) ? (int) $data['maxQueueSize'] : 0;
+                foreach ((array) $data['items'] as $item) {
+                    if ($maxQueueSize != 0 && count($this->_dataArray[$key]) >= $maxQueueSize) {
+                        break;
+                    }
+                    $serialized = $item['serialized'];
+                    if (in_array($serialized, $this->_dataArray[$key])) {
+                        continue;
+                    }
+                    if ($queuedBloom && $queuedBloom->maybeInSet($item['identity'])) {
+                        continue;
+                    }
+                    if (!$bloomOn && in_array($serialized, $queuedSet)) {
+                        continue;
+                    }
+                    if (!empty($item['reserve'])) {
+                        array_unshift($this->_dataArray[$key], $serialized);
+                    } else {
+                        array_push($this->_dataArray[$key], $serialized);
+                    }
+                    $added++;
+                }
+
+                if (!empty($data['markQueued'])) {
+                    if ($queuedBloom) {
+                        $queuedBloom->add($data['currentIdentity']);
+                    } elseif (!in_array($data['currentSerialized'], $queuedSet)) {
+                        array_push($this->_dataArray[$data['queuedKey']], $data['currentSerialized']);
+                    }
+                }
+                return $connection->send(serialize(array('ok' => true, 'added' => $added)));
+                break;
+            case 'setAdd':
+                if (!isset($this->_dataArray[$key]) || !is_array($this->_dataArray[$key])) {
+                    $this->_dataArray[$key] = array();
+                }
+                if (!in_array($data['value'], $this->_dataArray[$key])) {
+                    array_push($this->_dataArray[$key], $data['value']);
+                }
+                return $connection->send('b:1;');
+                break;
+            case 'setRemove':
+                if (isset($this->_dataArray[$key]) && is_array($this->_dataArray[$key])) {
+                    $pos = array_search($data['value'], $this->_dataArray[$key]);
+                    if ($pos !== false) {
+                        unset($this->_dataArray[$key][$pos]);
+                        $this->_dataArray[$key] = array_values($this->_dataArray[$key]);
+                    }
+                }
+                return $connection->send('b:1;');
+                break;
+            case 'setMembers':
+                if (!isset($this->_dataArray[$key]) || !is_array($this->_dataArray[$key])) {
+                    return $connection->send(serialize(array()));
+                }
+                return $connection->send(serialize(array_values($this->_dataArray[$key])));
+                break;
+            case 'hashIncr':
+                if (!isset($this->_dataArray[$key]) || !is_array($this->_dataArray[$key])) {
+                    $this->_dataArray[$key] = array();
+                }
+                $field = $data['field'];
+                if (!isset($this->_dataArray[$key][$field]) || !is_numeric($this->_dataArray[$key][$field])) {
+                    $this->_dataArray[$key][$field] = 0;
+                }
+                $this->_dataArray[$key][$field] += isset($data['step']) ? (int) $data['step'] : 1;
+                return $connection->send(serialize($this->_dataArray[$key][$field]));
+                break;
+            case 'hashGet':
+                if (!isset($this->_dataArray[$key]) || !is_array($this->_dataArray[$key])
+                    || !array_key_exists($data['field'], $this->_dataArray[$key])) {
+                    return $connection->send('N;');
+                }
+                return $connection->send(serialize($this->_dataArray[$key][$field]));
+                break;
+            case 'hashDelete':
+                if (isset($this->_dataArray[$key]) && is_array($this->_dataArray[$key])) {
+                    unset($this->_dataArray[$key][$data['field']]);
+                }
+                return $connection->send('b:1;');
+                break;
             default:
                 $connection->close(serialize('bad cmd ' . $cmd));
         }
